@@ -729,6 +729,11 @@ export class Topic {
     }], hardDel);
   }
 
+  // 一键软删除所有消息(软删除后自己看不到，别人能看到信息，不是撤回)
+  softDelAllMessages() {
+    return this._tinode.delAllMessages();
+  }
+
   /**
    * Delete multiple messages defined by their IDs. Hard-deleting messages requires Deleter permission.
    * @memberof Tinode.Topic#
@@ -1267,8 +1272,10 @@ export class Topic {
     const idx = this._messages.find({
       seq: seqId
     });
+    console.log('flushMessage1', this.name, idx, seqId);
     delete this._messageVersions[seqId];
     if (idx >= 0) {
+      console.log('flushMessage2', this.name, idx, seqId);
       this._tinode._db.remMessages(this.name, seqId);
       return this._messages.delAt(idx);
     }
@@ -1810,12 +1817,16 @@ export class Topic {
     this.clear = Math.max(clear, this.clear);
     const topic = this;
     let count = 0;
+    console.log('_processDelMessages1', clear, delseq);
     if (Array.isArray(delseq)) {
       delseq.forEach(function(range) {
+        console.log('_processDelMessages2', range);
         if (!range.hi) {
+          console.log('_processDelMessages3', range);
           count++;
           topic.flushMessage(range.low);
         } else {
+          console.log('_processDelMessages4', range);
           for (let i = range.low; i < range.hi; i++) {
             count++;
             topic.flushMessage(i);
@@ -2162,6 +2173,8 @@ export class TopicMe extends Topic {
           break;
         case 'del':
           // Update topic.del value.
+          console.log('src del', pres.src);
+          cont._processDelMessages(pres.clear, pres.delseq);
           break;
         default:
           this._tinode.logger("INFO: Unsupported presence update in 'me'", pres.what);

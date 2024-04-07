@@ -1795,6 +1795,13 @@ export class Tinode {
     return this.#send(pkt, pkt.del.id);
   }
 
+  softDelAllMessages() {
+    const pkt = this.#initPacket('del', 'me');
+    pkt.del.what = 'softDelAllMsg';
+    pkt.del.hard = false;
+    return this.#send(pkt, pkt.del.id);
+  }
+
   /**
    * Delete the topic alltogether. Requires Owner permission.
    *
