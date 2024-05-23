@@ -2147,6 +2147,33 @@ export class Tinode {
     }
   }
 
+  deleteExpiredMessages() {
+    const now = new Date();
+    this._db.mapTopics(data => {
+      let topic = this.#cacheGet('topic', data.name);
+      if (!topic) {
+        if (data.name == Const.TOPIC_ME) {
+          topic = new TopicMe();
+        } else if (data.name == Const.TOPIC_FND) {
+          topic = new TopicFnd();
+        } else {
+          topic = new Topic(data.name);
+        }
+      }
+
+      this._db.mapMessages(data.name, message => {
+        if (message.expired && message.expired <= now) {
+          console.log('比较', message.expired, now);
+          topic.flushMessage(message.seq);
+          if (topic.onData) {
+            topic.onData();
+          }
+          console.log(data.name, 'expire', message);
+        }
+      });
+    });
+  }
+
   // Callbacks:
   /**
    * Callback to report when the websocket is opened. The callback has no parameters.

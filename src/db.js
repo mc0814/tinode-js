@@ -421,6 +421,27 @@ export default class DB {
 
   // Messages.
 
+  mapMessages(topicName, callback, context) {
+    if (!this.isReady()) {
+      return this.disabled ? Promise.resolve([]) : Promise.reject(new Error("not initialized"));
+    }
+    return new Promise((resolve, reject) => {
+      const trx = this.db.transaction(['message']);
+      trx.onerror = event => {
+        this.#logger('PCache', 'mapMessages', event.target.error);
+        reject(event.target.error);
+      };
+      trx.objectStore('message').getAll(IDBKeyRange.bound([topicName, 0], [topicName, Number.MAX_SAFE_INTEGER])).onsuccess = event => {
+        if (callback) {
+          event.target.result.forEach(message => {
+            callback.call(context, message);
+          });
+        }
+        resolve(event.target.result);
+      };
+    });
+  }
+
   /**
    * Save message to persistent cache.
    * @memberOf DB
@@ -482,6 +503,37 @@ export default class DB {
           topic: topicName,
           seq: seq,
           _status: status
+        }));
+        trx.commit();
+      };
+    });
+  }
+
+  updMessageExpired(topicName, seq, expirePeriod, expired) {
+    if (!this.isReady()) {
+      return this.disabled ? Promise.resolve() : Promise.reject(new Error("not initialized"));
+    }
+    return new Promise((resolve, reject) => {
+      const trx = this.db.transaction(['message'], 'readwrite');
+      trx.onsuccess = event => {
+        resolve(event.target.result);
+      };
+      trx.onerror = event => {
+        this.#logger('PCache', 'updMessageExpired', event.target.error);
+        reject(event.target.error);
+      };
+      const req = trx.objectStore('message').get(IDBKeyRange.only([topicName, seq]));
+      req.onsuccess = event => {
+        const src = req.result || event.target.result;
+        if (!src || (src.expirePeriod == expirePeriod && src.expired == expired)) {
+          trx.commit();
+          return;
+        }
+        trx.objectStore('message').put(DB.#serializeMessage(src, {
+          topic: topicName,
+          seq: seq,
+          expirePeriod: expirePeriod,
+          expired: expired
         }));
         trx.commit();
       };
@@ -576,7 +628,7 @@ export default class DB {
 
   // Serializable topic fields.
   static #topic_fields = ['created', 'updated', 'deleted', 'read', 'recv', 'seq', 'clear', 'defacs',
-    'creds', 'public', 'trusted', 'private', 'touched', '_deleted'
+    'creds', 'public', 'trusted', 'private', 'touched', '_deleted', 'expirePeriod'
   ];
 
   // Copy data from src to Topic object.
@@ -634,7 +686,7 @@ export default class DB {
 
   static #serializeMessage(dst, msg) {
     // Serializable fields.
-    const fields = ['topic', 'seq', 'ts', '_status', 'from', 'head', 'content'];
+    const fields = ['topic', 'seq', 'ts', '_status', 'from', 'head', 'content', 'expirePeriod', 'expired'];
     const res = dst || {};
     fields.forEach((f) => {
       if (msg.hasOwnProperty(f)) {

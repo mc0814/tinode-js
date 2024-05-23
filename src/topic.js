@@ -62,6 +62,8 @@ export class Topic {
     // Per-topic system-provided data (accessible by all users).
     this.trusted = null;
 
+    this.expirePeriod = 86400;
+
     // Locally cached data
     // Subscribed users, for tracking read/recv/msg notifications.
     this._users = {};
@@ -297,7 +299,9 @@ export class Topic {
    * @returns {Object} message draft.
    */
   createMessage(data, noEcho) {
-    return this._tinode.createMessage(this.name, data, noEcho);
+    let pub = this._tinode.createMessage(this.name, data, noEcho);
+    pub.expirePeriod = this.expirePeriod;
+    return pub;
   }
 
   /**
@@ -732,6 +736,21 @@ export class Topic {
   // 一键软删除所有消息(软删除后自己看不到，别人能看到信息，不是撤回)
   softDelAllMessages() {
     return this._tinode.delAllMessages();
+  }
+
+  changeExpirePeriod(expirePeriod) {
+    return this._tinode.setMeta(this.name, {
+      sub: {
+        expirePeriod: expirePeriod
+      }
+    }).then(_ => {
+      this.setExpirePeriod(expirePeriod);
+    });
+  }
+  setExpirePeriod(expirePeriod) {
+    if (this.expirePeriod !== expirePeriod) {
+      this.expirePeriod = expirePeriod;
+    }
   }
 
   /**
@@ -1623,6 +1642,20 @@ export class Topic {
   _routePres(pres) {
     let user, uid;
     switch (pres.what) {
+      case 'updateMsg':
+        console.log('updateMsg', pres);
+        console.log('updateMsg1', this._messages);
+        this._tinode._db.updMessageExpired(this.name, pres.seq, pres.expirePeriod, pres.expired);
+        const topic = this
+        // setTimeout(function() {
+        //   topic.flushMessage(pres.seq);
+        //   console.log('settimeoue', pres.seq);
+        //   if (topic.onData) {
+        //     topic.onData();
+        //   }
+        // }, 2000);
+
+        break;
       case 'del':
         // Delete cached messages.
         this._processDelMessages(pres.clear, pres.delseq);
@@ -1739,6 +1772,10 @@ export class Topic {
 
       // Update to p2p desc is the same as user update. Update cached user.
       this._tinode._db.updUser(this.name, desc.public);
+    }
+
+    if (desc.hasOwnProperty('expirePeriod')) {
+      this.expirePeriod = desc.expirePeriod;
     }
 
     // Copy parameters from desc object to this topic.
