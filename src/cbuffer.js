@@ -1,7 +1,7 @@
 /**
  * @file In-memory sorted cache of objects.
  *
- * @copyright 2015-2022 Tinode LLC.
+ * @copyright 2015-2025 Tinode LLC.
  */
 'use strict';
 
@@ -84,20 +84,22 @@ export default class CBuffer {
   }
 
   /**
-   * Convenience method for getting the element from the end of the buffer.
+   * Convenience method for getting the last element from the buffer.
    * @memberof Tinode.CBuffer#
-   * @param {number} at - position to fetch from, counting from the end;
-   *    <code>undefined</code> or <code>null</code>  mean "last".
+   * @param {function} filter - optional filter to apply to elements. If filter is provided, the search
+   *   for the last element starts from the end of the buffer and goes backwards until the filter returns true.
    * @returns {Object} The last element in the buffer or <code>undefined</code> if buffer is empty.
    */
-  getLast(at) {
-    at |= 0;
-    return this.buffer.length > at ? this.buffer[this.buffer.length - 1 - at] : undefined;
+  getLast(filter) {
+    return filter ?
+      this.buffer.findLast(filter) :
+      this.buffer[this.buffer.length - 1];
   }
 
   /**
-   * Add new element(s) to the buffer. Variadic: takes one or more arguments. If an array is passed as a single
-   * argument, its elements are inserted individually.
+   * Insert new element(s) to the buffer at the correct position according to the sort method.
+   * Variadic: takes one or more arguments. If an array is passed as a single argument, its
+   * elements are inserted individually.
    * @memberof Tinode.CBuffer#
    *
    * @param {...Object|Array} - One or more objects to insert.
@@ -174,13 +176,13 @@ export default class CBuffer {
    * @memberof Tinode.CBuffer#
    *
    * @param {Tinode.ForEachCallbackType} callback - Function to call for each element.
-   * @param {number} startIdx - Optional index to start iterating from (inclusive).
-   * @param {number} beforeIdx - Optional index to stop iterating before (exclusive).
+   * @param {number} startIdx - Optional index to start iterating from (inclusive), default: 0.
+   * @param {number} beforeIdx - Optional index to stop iterating before (exclusive), default: length of the buffer.
    * @param {Object} context - calling context (i.e. value of <code>this</code> in callback)
    */
   forEach(callback, startIdx, beforeIdx, context) {
-    startIdx = startIdx | 0;
-    beforeIdx = beforeIdx || this.buffer.length;
+    startIdx = Math.max(0, startIdx | 0);
+    beforeIdx = Math.min(beforeIdx || this.buffer.length, this.buffer.length);
 
     for (let i = startIdx; i < beforeIdx; i++) {
       callback.call(context, this.buffer[i],

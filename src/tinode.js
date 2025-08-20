@@ -1,10 +1,10 @@
 /**
  * @module tinode-sdk
  *
- * @copyright 2015-2022 Tinode LLC.
+ * @copyright 2015-2025 Tinode LLC.
  * @summary Javascript bindings for Tinode.
  * @license Apache 2.0
- * @version 0.20
+ * @version 0.24
  *
  * See <a href="https://github.com/tinode/webapp">https://github.com/tinode/webapp</a> for real-life usage.
  *
@@ -56,11 +56,9 @@ import DBCache from './db.js';
 import Drafty from './drafty.js';
 import LargeFileHelper from './large-file.js';
 import MetaGetBuilder from './meta-builder.js';
-import {
-  Topic,
-  TopicMe,
-  TopicFnd
-} from './topic.js';
+import Topic from './topic.js';
+import TopicFnd from './fnd-topic.js';
+import TopicMe from './me-topic.js';
 
 import {
   isUrlRelative,
@@ -404,9 +402,7 @@ export class Tinode {
 
     this._persist = config.persist;
     // Initialize object regardless. It simplifies the code.
-    this._db = new DBCache(err => {
-      this.logger('DB', err);
-    }, this.logger);
+    this._db = new DBCache(this.logger, this.logger);
 
     if (this._persist) {
       // Create the persistent cache.
@@ -414,7 +410,7 @@ export class Tinode {
       const prom = [];
       this._db.initDatabase().then(_ => {
         // First load topics into memory.
-        return this._db.mapTopics((data) => {
+        return this._db.mapTopics(data => {
           let topic = this.#cacheGet('topic', data.name);
           if (topic) {
             return;
@@ -429,6 +425,9 @@ export class Tinode {
           this._db.deserializeTopic(topic, data);
           this.#attachCacheToTopic(topic);
           topic._cachePutSelf();
+          this._db.maxDelId(topic.name).then(clear => {
+            topic._maxDel = Math.max(topic._maxDel, clear || 0);
+          });
           // Topic loaded from DB is not new.
           delete topic._new;
           // Request to load messages and save the promise.
@@ -810,7 +809,7 @@ export class Tinode {
             'desc': {},
             'sub': {},
             'tags': [],
-            'ephemeral': {}
+            'aux': {}
           }
         };
 
@@ -969,6 +968,14 @@ export class Tinode {
     return Topic.isMeTopicName(name);
   }
   /**
+   * Check if the given topic name is a name of a 'slf' topic.
+   * @param {string} name - Name of the topic to test.
+   * @returns {boolean} <code>true</code> if the name is a name of a 'slf' topic, <code>false</code> otherwise.
+   */
+  static isSelfTopicName(name) {
+    return Topic.isSelfTopicName(name);
+  }
+  /**
    * Check if the given topic name is a name of a group topic.
    * @param {string} name - Name of the topic to test.
    * @returns {boolean} <code>true</code> if the name is a name of a group topic, <code>false</code> otherwise.
@@ -1056,6 +1063,99 @@ export class Tinode {
    */
   static isNullValue(str) {
     return str === Const.DEL_CHAR;
+  }
+  /**
+   * Check if the given seq ID is likely to be issued by the server as oppisite to being temporary locally assigned ID.
+   * @param {int} seq - seq ID to check.
+   * @returns {boolean} <code>true</code> if seq is likely server-issued, <code>false</code> otherwise.
+   */
+  static isServerAssignedSeq(seq) {
+    return seq > 0 && seq < Const.LOCAL_SEQID;
+  }
+
+  /**
+   * Check if the given string is a valid tag value.
+   * @param {string} tag - string to check.
+   * @returns {boolean} <code>true</code> if the string is a valid tag value, <code>false</code> otherwise.
+   */
+  static isValidTagValue(tag) {
+    // 4-24 characters, starting with letter or digit, then letters, digits, hyphen, underscore.
+    const ALIAS_REGEX = /^[a-z0-9][a-z0-9_\-]{3,23}$/i;
+    return tag && typeof tag == 'string' && tag.length > 3 && tag.length < 24 && ALIAS_REGEX.test(tag);
+  }
+
+  /**
+   * Split fully-qualified tag into prefix and value.
+   */
+  static tagSplit(tag) {
+    if (!tag) {
+      return null;
+    }
+
+    tag = tag.trim();
+
+    const splitAt = tag.indexOf(':');
+    if (splitAt <= 0) {
+      // Invalid syntax.
+      return null;
+    }
+
+    const value = tag.substring(splitAt + 1);
+    if (!value) {
+      return null;
+    }
+    return {
+      prefix: tag.substring(0, splitAt),
+      value: value
+    };
+  }
+
+  /**
+   * Set a unique namespace tag.
+   * If the tag with this namespace is already present then it's replaced with the new tag.
+   * @param uniqueTag tag to add, must be fully-qualified; if null or empty, no action is taken.
+   */
+  static setUniqueTag(tags, uniqueTag) {
+    if (!tags || tags.length == 0) {
+      // No tags, just add the new one.
+      return [uniqueTag];
+    }
+
+    const parts = Tinode.tagSplit(uniqueTag)
+    if (!parts) {
+      // Invalid tag.
+      return tags;
+    }
+
+    // Remove the old tag with the same prefix.
+    tags = tags.filter(tag => tag && !tag.startsWith(parts.prefix));
+    // Add the new tag.
+    tags.push(uniqueTag);
+    return tags;
+  }
+
+  /**
+   * Remove a unique tag with the given prefix.
+   * @param prefix prefix to remove
+   */
+  static clearTagPrefix(tags, prefix) {
+    if (!tags || tags.length == 0) {
+      return [];
+    }
+    return tags.filter(tag => tag && !tag.startsWith(prefix));
+  }
+
+  /**
+   * Find the first tag with the given prefix.
+   * @param prefix prefix to search for.
+   * @return the first tag with the given prefix if found or <code>undefined</code>.
+   */
+  static tagByPrefix(tags, prefix) {
+    if (!tags) {
+      return undefined;
+    }
+
+    return tags.find(tag => tag && tag.startsWith(prefix));
   }
 
   // Instance methods.
@@ -1448,6 +1548,8 @@ export class Tinode {
    * @type {Object}
    * @property {SetDesc=} desc - Topic initialization parameters when creating a new topic or a new subscription.
    * @property {SetSub=} sub - Subscription initialization parameters.
+   * @property {Array.<string>=} tags - Search tags.
+   * @property {Object} aux - Auxiliary topic data.
    * @property {Array.<string>=} attachments - URLs of out of band attachments used in parameters.
    */
   /**
@@ -1508,6 +1610,9 @@ export class Tinode {
 
       if (setParams.tags) {
         pkt.sub.set.tags = setParams.tags;
+      }
+      if (setParams.aux) {
+        pkt.sub.set.aux = setParams.aux;
       }
     }
     return this.#send(pkt, pkt.sub.id);
@@ -1697,14 +1802,6 @@ export class Tinode {
   }
 
   /**
-   * @typedef GetQuery
-   * @type {Object}
-   * @property {GetOptsType=} desc - If provided (even if empty), fetch topic description.
-   * @property {GetOptsType=} sub - If provided (even if empty), fetch topic subscriptions.
-   * @property {GetDataType=} data - If provided (even if empty), get messages.
-   */
-
-  /**
    * @typedef GetOptsType
    * @type {Object}
    * @property {Date=} ims - "If modified since", fetch data only it was was modified since stated date.
@@ -1714,9 +1811,18 @@ export class Tinode {
   /**
    * @typedef GetDataType
    * @type {Object}
-   * @property {number=} since - Load messages with seq id equal or greater than this value.
-   * @property {number=} before - Load messages with seq id lower than this number.
+   * @property {number=} since - Load messages with seq ID equal or greater than this value.
+   * @property {number=} before - Load messages with seq ID lower than this number.
    * @property {number=} limit - Maximum number of results to return.
+   * @property {Array.<SeqRange>=} range - Ranges of seq IDs to fetch.
+   */
+
+  /**
+   * @typedef GetQuery
+   * @type {Object}
+   * @property {GetOptsType=} desc - If provided (even if empty), fetch topic description.
+   * @property {GetOptsType=} sub - If provided (even if empty), fetch topic subscriptions.
+   * @property {GetDataType=} data - If provided (even if empty), get messages.
    */
 
   /**
@@ -1747,7 +1853,7 @@ export class Tinode {
     const what = [];
 
     if (params) {
-      ['desc', 'sub', 'tags', 'cred', 'ephemeral'].forEach(function(key) {
+      ['desc', 'sub', 'tags', 'cred', 'aux'].forEach(key => {
         if (params.hasOwnProperty(key)) {
           what.push(key);
           pkt.set[key] = params[key];
@@ -1769,9 +1875,9 @@ export class Tinode {
   }
 
   /**
-   * Range of message IDs to delete.
+   * Range of message IDs.
    *
-   * @typedef DelRange
+   * @typedef SeqRange
    * @type {Object}
    * @property {number} low - low end of the range, inclusive (closed).
    * @property {number=} hi - high end of the range, exclusive (open).
@@ -1780,7 +1886,7 @@ export class Tinode {
    * Delete some or all messages in a topic.
    *
    * @param {string} topic - Topic name to delete messages from.
-   * @param {DelRange[]} list - Ranges of message IDs to delete.
+   * @param {Array.<SeqRange>} list - Ranges of message IDs to delete.
    * @param {boolean=} hard - Hard or soft delete
    *
    * @returns {Promise} Promise which will be resolved/rejected on receiving server reply.
@@ -1872,6 +1978,7 @@ export class Tinode {
    * @param {string} topicName - Name of the topic where the mesage is being aknowledged.
    * @param {string} what - Action being aknowledged, either <code>"read"</code> or <code>"recv"</code>.
    * @param {number} seq - Maximum id of the message being acknowledged.
+   * @throws {Error} if <code>seq</code> is invalid.
    */
   note(topicName, what, seq) {
     if (seq <= 0 || seq >= Const.LOCAL_SEQID) {
@@ -2280,9 +2387,17 @@ Tinode.DEL_CHAR = Const.DEL_CHAR;
 // Names of keys to server-provided configuration limits.
 Tinode.MAX_MESSAGE_SIZE = 'maxMessageSize';
 Tinode.MAX_SUBSCRIBER_COUNT = 'maxSubscriberCount';
+Tinode.MIN_TAG_LENGTH = 'minTagLength';
+Tinode.MAX_TAG_LENGTH = 'maxTagLength';
 Tinode.MAX_TAG_COUNT = 'maxTagCount';
 Tinode.MAX_FILE_UPLOAD_SIZE = 'maxFileUploadSize';
 Tinode.REQ_CRED_VALIDATORS = 'reqCred';
+Tinode.MSG_DELETE_AGE = 'msgDelAge';
 
 // Tinode URI topic ID prefix, 'scheme:path/'.
 Tinode.URI_TOPIC_ID_PREFIX = 'tinode:topic/';
+
+// Tag prefixes for alias, email, phone.
+Tinode.TAG_ALIAS = Const.TAG_ALIAS;
+Tinode.TAG_EMAIL = Const.TAG_EMAIL;
+Tinode.TAG_PHONE = Const.TAG_PHONE;

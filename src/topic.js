@@ -1,7 +1,7 @@
 /**
  * @file Topic management.
  *
- * @copyright 2015-2022 Tinode LLC.
+ * @copyright 2015-2025 Tinode LLC.
  */
 'use strict';
 
@@ -12,15 +12,17 @@ import * as Const from './config.js';
 import Drafty from './drafty.js';
 import MetaGetBuilder from './meta-builder.js';
 import {
+  listToRanges,
   mergeObj,
   mergeToCache,
-  normalizeArray
+  normalizeArray,
+  normalizeRanges
 } from './utils.js';
 
 /**
  * Topic is a class representing a logical communication channel.
  */
-export class Topic {
+export default class Topic {
   /**
    * @callback onData
    * @param {Data} data - Data packet
@@ -86,6 +88,9 @@ export class Topic {
     this._tags = [];
     // Credentials such as email or phone number.
     this._credentials = [];
+    // Auxiliary data
+    this._aux = {};
+
     // Message versions cache (e.g. for edited messages).
     // Keys: original message seq ID.
     // Values: CBuffers containing newer versions of the original message
@@ -121,6 +126,7 @@ export class Topic {
       this.onSubsUpdated = callbacks.onSubsUpdated;
       this.onTagsUpdated = callbacks.onTagsUpdated;
       this.onCredsUpdated = callbacks.onCredsUpdated;
+      this.onAuxUpdated = callbacks.onAuxUpdated;
       this.onDeleteTopic = callbacks.onDeleteTopic;
       this.onAllMessagesReceived = callbacks.onAllMessagesReceived;
     }
@@ -144,7 +150,8 @@ export class Topic {
       'nch': Const.TOPIC_GRP,
       'chn': Const.TOPIC_GRP,
       'usr': Const.TOPIC_P2P,
-      'sys': Const.TOPIC_SYS
+      'sys': Const.TOPIC_SYS,
+      'slf': Const.TOPIC_SLF
     };
     return types[(typeof name == 'string') ? name.substring(0, 3) : 'xxx'];
   }
@@ -157,6 +164,16 @@ export class Topic {
    */
   static isMeTopicName(name) {
     return Topic.topicType(name) == Const.TOPIC_ME;
+  }
+
+  /**
+   * Check if the given topic name is a name of a 'slf' topic.
+   *
+   * @param {string} name - Name of the topic to test.
+   * @returns {boolean} <code>true</code> if the name is a name of a 'slf' topic, <code>false</code> otherwise.
+   */
+  static isSelfTopicName(name) {
+    return Topic.topicType(name) == Const.TOPIC_SLF;
   }
 
   /**
@@ -189,7 +206,7 @@ export class Topic {
    * @returns {boolean} <code>true</code> if the name is a name of a p2p or group topic, <code>false</code> otherwise.
    */
   static isCommTopicName(name) {
-    return Topic.isP2PTopicName(name) || Topic.isGroupTopicName(name);
+    return Topic.isP2PTopicName(name) || Topic.isGroupTopicName(name) || Topic.isSelfTopicName(name);
   }
 
   /**
@@ -214,6 +231,11 @@ export class Topic {
   static isChannelTopicName(name) {
     return (typeof name == 'string') &&
       (name.substring(0, 3) == Const.TOPIC_CHAN || name.substring(0, 3) == Const.TOPIC_NEW_CHAN);
+  }
+
+  // Returns true if pub is meant to replace another message (e.g. original message was edited).
+  static #isReplacementMsg(pub) {
+    return pub.head && pub.head.replace;
   }
 
   /**
@@ -472,7 +494,7 @@ export class Topic {
   }
 
   /**
-   * Request topic metadata from the server.
+   * Request topic metadata from the local cache or from the server.
    * @memberof Tinode.Topic#
    *
    * @param {Tinode.GetQuery} request parameters
@@ -485,22 +507,30 @@ export class Topic {
   }
 
   /**
-   * Request more messages from the server
+   * Request more messages from the server. The goal is to load continous range of messages
+   * covering at least between 'min' and 'max' + one full page forward (newer = true) or backwards
+   * (newer=false).
    * @memberof Tinode.Topic#
    *
    * @param {number} limit number of messages to get.
-   * @param {boolean} forward if true, request newer messages.
+   * @param {Array.<Range>} gaps - ranges of messages to load.
+   * @param {number} min if non-negative, request newer messages with seq >= min.
+   * @param {number} max if positive, request older messages with seq < max.
+   * @returns {Promise} Promise to be resolved/rejected when the server responds to request.
    */
-  getMessagesPage(limit, forward) {
-    let query = forward ?
-      this.startMetaQuery().withLaterData(limit) :
-      this.startMetaQuery().withEarlierData(limit);
-
+  getMessagesPage(limit, gaps, min, max, newer) {
+    let query = gaps ?
+      this.startMetaQuery().withDataRanges(gaps, limit) :
+      newer ?
+      this.startMetaQuery().withData(min, undefined, limit) :
+      this.startMetaQuery().withData(undefined, max, limit);
     // First try fetching from DB, then from the server.
     return this._loadMessages(this._tinode._db, query.extract('data'))
-      .then((count) => {
-        if (count == limit) {
-          // Got enough messages from local cache.
+      .then(count => {
+        // Recalculate missing ranges.
+        gaps = this.msgHasMoreMessages(min, max, newer);
+        if (gaps.length == 0) {
+          // All messages loaded.
           return Promise.resolve({
             topic: this.name,
             code: 200,
@@ -513,19 +543,71 @@ export class Topic {
         // Reduce the count of requested messages.
         limit -= count;
         // Update query with new values loaded from DB.
-        query = forward ? this.startMetaQuery().withLaterData(limit) :
-          this.startMetaQuery().withEarlierData(limit);
-        let promise = this.getMeta(query.build());
-        if (!forward) {
-          promise = promise.then(ctrl => {
-            if (ctrl && ctrl.params && !ctrl.params.count) {
-              this._noEarlierMsgs = true;
+        query = this.startMetaQuery().withDataRanges(gaps, limit);
+        return this.getMeta(query.build());
+      });
+  }
+
+  /**
+   * Request to get pinned messages from the local cache or from the server.
+   * @memberof Tinode.Topic#
+   * @returns {Promise} Promise to be resolved/rejected when the server responds to request.
+   */
+  getPinnedMessages() {
+    const pins = this.aux('pins');
+    if (!Array.isArray(pins)) {
+      return Promise.resolve(0);
+    }
+
+    const loaded = [];
+    let remains = pins;
+    // First try fetching from DB, then check deleted log, then ask the server.
+    return this._tinode._db.readMessages(this.name, {
+        ranges: listToRanges(remains)
+      })
+      .then(msgs => {
+        msgs.forEach(data => {
+          // The 'data' could be undefined.
+          if (data) {
+            loaded.push(data.seq);
+            this._messages.put(data);
+            this._maybeUpdateMessageVersionsCache(data);
+          }
+        });
+        if (loaded.length < pins.length) {
+          // Some messages are missing, try dellog.
+          remains = pins.filter(seq => !loaded.includes(seq));
+          return this._tinode._db.readMessages(this.name, {
+            ranges: listToRanges(remains)
+          });
+        }
+        return null;
+      })
+      .then(ranges => {
+        if (ranges) {
+          // Found some deleted ranges in dellog.
+          remains.forEach(seq => {
+            if (ranges.find(r => r.low <= seq && r.hi > seq)) {
+              loaded.push(seq);
             }
           });
         }
-        return promise;
+        if (loaded.length == pins.length) {
+          // Got all pinned messages from the local cache.
+          return Promise.resolve({
+            topic: this.name,
+            code: 200,
+            params: {
+              count: loaded.length
+            }
+          });
+        }
+
+        remains = pins.filter(seq => !loaded.includes(seq));
+        return this.getMeta(this.startMetaQuery().withDataList(remains).build());
       });
   }
+
   /**
    * Update topic metadata.
    * @memberof Tinode.Topic#
@@ -577,6 +659,9 @@ export class Topic {
         }
         if (params.cred) {
           this._processMetaCreds([params.cred], true);
+        }
+        if (params.aux) {
+          this._processMetaAux(params.aux);
         }
 
         return ctrl;
@@ -641,11 +726,52 @@ export class Topic {
     });
   }
   /**
-   * Delete messages. Hard-deleting messages requires Owner permission.
+   * Set message as pinned or unpinned by adding it to aux.pins array. Wrapper for {@link Tinode#setMeta}.
+   * @memberof Tinode.Topic#
+   *
+   * @param {number} seq - seq ID of the message to pin or un-pin.
+   * @param {boolean} pin - true to pin the message, false to un-pin.
+   *
+   * @returns {Promise} Promise to be resolved/rejected when the server responds to request.
+   */
+  pinMessage(seq, pin) {
+    let pinned = this.aux('pins');
+    if (!Array.isArray(pinned)) {
+      pinned = [];
+    }
+    let changed = false;
+    if (pin) {
+      if (!pinned.includes(seq)) {
+        changed = true;
+        if (pinned.length == Const.MAX_PINNED_COUNT) {
+          pinned.shift();
+        }
+        pinned.push(seq);
+      }
+    } else {
+      if (pinned.includes(seq)) {
+        changed = true;
+        pinned = pinned.filter(id => id != seq);
+        if (pinned.length == 0) {
+          pinned = Const.DEL_CHAR;
+        }
+      }
+    }
+    if (changed) {
+      return this.setMeta({
+        aux: {
+          pins: pinned
+        }
+      });
+    }
+    return Promise.resolve();
+  }
+  /**
+   * Delete messages. Hard-deleting messages requires Deleter (D) permission.
    * Wrapper for {@link Tinode#delMessages}.
    * @memberof Tinode.Topic#
    *
-   * @param {Tinode.DelRange[]} ranges - Ranges of message IDs to delete.
+   * @param {Array.<Tinode.SeqRange>} ranges - Ranges of message IDs to delete.
    * @param {boolean=} hard - Hard or soft delete
    * @returns {Promise} Promise to be resolved/rejected when the server responds to request.
    */
@@ -654,32 +780,7 @@ export class Topic {
       return Promise.reject(new Error("Cannot delete messages in inactive topic"));
     }
 
-    // Sort ranges in accending order by low, the descending by hi.
-    ranges.sort((r1, r2) => {
-      if (r1.low < r2.low) {
-        return true;
-      }
-      if (r1.low == r2.low) {
-        return !r2.hi || (r1.hi >= r2.hi);
-      }
-      return false;
-    });
-
-    // Remove pending messages from ranges possibly clipping some ranges.
-    let tosend = ranges.reduce((out, r) => {
-      if (r.low < Const.LOCAL_SEQID) {
-        if (!r.hi || r.hi < Const.LOCAL_SEQID) {
-          out.push(r);
-        } else {
-          // Clip hi to max allowed value.
-          out.push({
-            low: r.low,
-            hi: this._maxSeq + 1
-          });
-        }
-      }
-      return out;
-    }, []);
+    const tosend = normalizeRanges(ranges, this._maxSeq)
 
     // Send {del} message, return promise
     let result;
@@ -695,16 +796,26 @@ export class Topic {
     // Update local cache.
     return result.then(ctrl => {
       if (ctrl.params.del > this._maxDel) {
-        this._maxDel = ctrl.params.del;
+        this._maxDel = Math.max(ctrl.params.del, this._maxDel);
+        this.clear = Math.max(ctrl.params.del, this.clear);
       }
 
-      ranges.forEach((r) => {
-        if (r.hi) {
-          this.flushMessageRange(r.low, r.hi);
+      ranges.forEach(rec => {
+        if (rec.hi) {
+          this.flushMessageRange(rec.low, rec.hi);
         } else {
-          this.flushMessage(r.low);
+          this.flushMessage(rec.low);
         }
+        this._messages.put({
+          seq: rec.low,
+          low: rec.low,
+          hi: rec.hi,
+          _deleted: true
+        });
       });
+
+      // Make a record.
+      this._tinode._db.addDelLog(this.name, ctrl.params.del, ranges);
 
       if (this.onData) {
         // Calling with no parameters to indicate the messages were deleted.
@@ -763,31 +874,8 @@ export class Topic {
    * @returns {Promise} Promise to be resolved/rejected when the server responds to request.
    */
   delMessagesList(list, hardDel) {
-    // Sort the list in ascending order
-    list.sort((a, b) => a - b);
-    // Convert the array of IDs to ranges.
-    let ranges = list.reduce((out, id) => {
-      if (out.length == 0) {
-        // First element.
-        out.push({
-          low: id
-        });
-      } else {
-        let prev = out[out.length - 1];
-        if ((!prev.hi && (id != prev.low + 1)) || (id > prev.hi)) {
-          // New range.
-          out.push({
-            low: id
-          });
-        } else {
-          // Expand existing range.
-          prev.hi = prev.hi ? Math.max(prev.hi, id + 1) : id + 1;
-        }
-      }
-      return out;
-    }, []);
     // Send {del} message, return promise
-    return this.delMessages(ranges, hardDel);
+    return this.delMessages(listToRanges(list), hardDel);
   }
 
   /**
@@ -1051,6 +1139,30 @@ export class Topic {
     return this._tags.slice(0);
   }
   /**
+   * Get auxiliary entry by key.
+   * @memberof Tinode.Topic#
+   * @param {string} key - auxiliary data key to retrieve.
+   * @return {Object} value for the <code>key</code> or <code>undefined</code>.
+   */
+  aux(key) {
+    return this._aux[key];
+  }
+  /**
+   * Get alias value (unique tag with alias: prefix), if present.
+   * The prefix is stripped off.
+   * @memberof Tinode.Topic#
+   * @return {string} alias or <code>undefined</code>.
+   */
+  alias() {
+    const alias = this._tags && this._tags.find(t => t.startsWith(Const.TAG_ALIAS));
+    if (!alias) {
+      return undefined;
+    }
+    // Remove 'alias:' prefix.
+    return alias.substring(Const.TAG_ALIAS.length);
+  }
+
+  /**
    * Get cached subscription for the given user ID.
    * @memberof Tinode.Topic#
    *
@@ -1104,8 +1216,12 @@ export class Topic {
         // save displayable messages in a temporary buffer.
         let msgs = [];
         this._messages.forEach((msg, unused1, unused2, i) => {
-          if (this._isReplacementMsg(msg)) {
+          if (Topic.#isReplacementMsg(msg)) {
             // Skip replacements.
+            return;
+          }
+          if (msg._deleted) {
+            // Skip deleted ranges.
             return;
           }
           // In case the massage was edited, replace timestamp of the version with the original's timestamp.
@@ -1131,7 +1247,7 @@ export class Topic {
     }
   }
   /**
-   * Get the message from cache by <code>seq</code>.
+   * Get the message from cache by literal <code>seq</code> (does not resolve message edits).
    * @memberof Tinode.Topic#
    *
    * @param {number} seq - message seqId to search for.
@@ -1147,13 +1263,13 @@ export class Topic {
     return undefined;
   }
   /**
-   * Get the most recent message from cache. This method counts all messages, including deleted ranges.
+   * Get the most recent non-deleted message from cache.
    * @memberof Tinode.Topic#
    *
    * @returns {Object} the most recent cached message or <code>undefined</code>, if no messages are cached.
    */
   latestMessage() {
-    return this._messages.getLast();
+    return this._messages.getLast(msg => !msg._deleted);
   }
   /**
    * Get the latest version for message.
@@ -1264,12 +1380,50 @@ export class Topic {
    * Check if cached message IDs indicate that the server may have more messages.
    * @memberof Tinode.Topic#
    *
+   * @param {number} min - smallest seq ID loaded range.
+   * @param {number} max - greatest seq ID in loaded range.
    * @param {boolean} newer - if <code>true</code>, check for newer messages only.
+   * @returns {Array.<Range>} - missing ranges in the selected direction.
    */
-  msgHasMoreMessages(newer) {
-    return newer ? this.seq > this._maxSeq :
-      // _minSeq could be more than 1, but earlier messages could have been deleted.
-      (this._minSeq > 1 && !this._noEarlierMsgs);
+  msgHasMoreMessages(min, max, newer) {
+    // Find gaps in cached messages.
+    const gaps = [];
+    if (min >= max) {
+      return gaps;
+    }
+    let maxSeq = 0;
+    let gap;
+    this._messages.forEach((msg, prev) => {
+      const p = prev || {
+        seq: 0
+      };
+      const expected = p._deleted ? p.hi : p.seq + 1;
+      if (msg.seq > expected) {
+        gap = {
+          low: expected,
+          hi: msg.seq
+        };
+      } else {
+        gap = null;
+      }
+      // If newer: collect all gaps from min to infinity.
+      // If older: collect all gaps from max to zero.
+      if (gap && (newer ? gap.hi >= min : gap.low < max)) {
+        gaps.push(gap);
+      }
+      maxSeq = expected;
+    });
+
+    if (maxSeq < this.seq) {
+      gap = {
+        low: maxSeq + 1,
+        hi: this.seq + 1
+      };
+      if (newer ? gap.hi >= min : gap.low < max) {
+        gaps.push(gap);
+      }
+    }
+    return gaps;
   }
   /**
    * Check if the given seq Id is id of the most recent message.
@@ -1441,6 +1595,15 @@ export class Topic {
     return Topic.isMeTopicName(this.name);
   }
   /**
+   * Check if topic is a 'slf' topic.
+   * @memberof Tinode.Topic#
+   *
+   * @returns {boolean} - <code>true</code> if topic is a 'slf' topic, <code>false</code> otherwise.
+   */
+  isSelfType() {
+    return Topic.isSelfTopicName(this.name);
+  }
+  /**
    * Check if topic is a channel.
    * @memberof Tinode.Topic#
    *
@@ -1516,15 +1679,10 @@ export class Topic {
     return status;
   }
 
-  // Returns true if pub is meant to replace another message (e.g. original message was edited).
-  _isReplacementMsg(pub) {
-    return pub.head && pub.head.replace;
-  }
-
   // If msg is a replacement for another message, save the msg in the message versions cache
   // as a newer version for the message it's supposed to replace.
   _maybeUpdateMessageVersionsCache(msg) {
-    if (!this._isReplacementMsg(msg)) {
+    if (!Topic.#isReplacementMsg(msg)) {
       // Check if this message is the original in the chain of edits and if so
       // ensure all version have the same sender.
       if (this._messageVersions[msg.seq]) {
@@ -1582,11 +1740,15 @@ export class Topic {
 
     if (data.head && data.head.webrtc && data.head.mime == Drafty.getContentType() && data.content) {
       // Rewrite VC body with info from the headers.
-      data.content = Drafty.updateVideoCall(data.content, {
+      const upd = {
         state: data.head.webrtc,
         duration: data.head['webrtc-duration'],
         incoming: !outgoing,
-      });
+      };
+      if (data.head.vc) {
+        upd.vc = true;
+      }
+      data.content = Drafty.updateVideoCall(data.content, upd);
     }
 
     if (!data._noForwarding) {
@@ -1633,6 +1795,9 @@ export class Topic {
     }
     if (meta.cred) {
       this._processMetaCreds(meta.cred);
+    }
+    if (meta.aux) {
+      this._processMetaAux(meta.aux);
     }
     if (this.onMeta) {
       this.onMeta(meta);
@@ -1681,6 +1846,10 @@ export class Topic {
         if (pres.src && !this._tinode.isTopicCached(pres.src)) {
           this.getMeta(this.startMetaQuery().withOneSub(undefined, pres.src).build());
         }
+        break;
+      case 'aux':
+        // Auxiliary data updated.
+        this.getMeta(this.startMetaQuery().withAux().build());
         break;
       case 'acs':
         uid = pres.src || this._tinode.getCurrentUserID();
@@ -1838,43 +2007,55 @@ export class Topic {
   }
   // Called by Tinode when meta.tags is recived.
   _processMetaTags(tags) {
-    if (tags.length == 1 && tags[0] == Const.DEL_CHAR) {
+    if (tags == Const.DEL_CHAR || (tags.length == 1 && tags[0] == Const.DEL_CHAR)) {
       tags = [];
     }
     this._tags = tags;
+    this._tinode._db.updTopic(this);
     if (this.onTagsUpdated) {
       this.onTagsUpdated(tags);
     }
   }
   // Do nothing for topics other than 'me'
   _processMetaCreds(creds) {}
+
+  // Called by Tinode when meta.aux is recived.
+  _processMetaAux(aux) {
+    aux = (!aux || aux == Const.DEL_CHAR) ? {} : aux;
+    this._aux = mergeObj(this._aux, aux);
+    this._tinode._db.updTopic(this);
+    if (this.onAuxUpdated) {
+      this.onAuxUpdated(this._aux);
+    }
+  }
+
   // Delete cached messages and update cached transaction IDs
   _processDelMessages(clear, delseq) {
     this._maxDel = Math.max(clear, this._maxDel);
     this.clear = Math.max(clear, this.clear);
-    const topic = this;
     let count = 0;
     console.log('_processDelMessages1', clear, delseq);
     if (Array.isArray(delseq)) {
-      delseq.forEach(function(range) {
-        console.log('_processDelMessages2', range);
-        if (!range.hi) {
-          console.log('_processDelMessages3', range);
+      delseq.forEach(rec => {
+        if (!rec.hi) {
           count++;
-          topic.flushMessage(range.low);
+          this.flushMessage(rec.low);
         } else {
-          console.log('_processDelMessages4', range);
-          for (let i = range.low; i < range.hi; i++) {
-            count++;
-            topic.flushMessage(i);
-          }
+          count += rec.hi - rec.low;
+          this.flushMessageRange(rec.low, rec.hi);
         }
+        this._messages.put({
+          seq: rec.low,
+          low: rec.low,
+          hi: rec.hi,
+          _deleted: true
+        });
       });
+
+      this._tinode._db.addDelLog(this.name, clear, delseq);
     }
 
     if (count > 0) {
-      // this._updateDeletedRanges();
-
       if (this.onData) {
         this.onData();
       }
@@ -1935,19 +2116,15 @@ export class Topic {
   }
 
   // Load most recent messages from persistent cache.
-  _loadMessages(db, params) {
-    const {
-      since,
-      before,
-      limit
-    } = params || {};
-    return db.readMessages(this.name, {
-        since: since,
-        before: before,
-        limit: limit || Const.DEFAULT_MESSAGES_PAGE
-      })
+  _loadMessages(db, query) {
+    query = query || {};
+    query.limit = query.limit || Const.DEFAULT_MESSAGES_PAGE;
+
+    // Count of message loaded from DB.
+    let count = 0;
+    return db.readMessages(this.name, query)
       .then(msgs => {
-        msgs.forEach((data) => {
+        msgs.forEach(data => {
           if (data.seq > this._maxSeq) {
             this._maxSeq = data.seq;
           }
@@ -1957,9 +2134,25 @@ export class Topic {
           this._messages.put(data);
           this._maybeUpdateMessageVersionsCache(data);
         });
-        return msgs.length;
+        count = msgs.length;
+      })
+      .then(_ => db.readDelLog(this.name, query))
+      .then(dellog => {
+        return dellog.forEach(rec => {
+          this._messages.put({
+            seq: rec.low,
+            low: rec.low,
+            hi: rec.hi,
+            _deleted: true
+          });
+        });
+      })
+      .then(_ => {
+        // DEBUG
+        return count;
       });
   }
+
   // Push or {pres}: message received.
   _updateReceived(seq, act) {
     this.touched = new Date();
@@ -1971,499 +2164,5 @@ export class Topic {
     }
     this.unread = this.seq - (this.read | 0);
     this._tinode._db.updTopic(this);
-  }
-}
-
-/**
- * @class TopicMe - special case of {@link Tinode.Topic} for
- * managing data of the current user, including contact list.
- * @extends Tinode.Topic
- * @memberof Tinode
- *
- * @param {TopicMe.Callbacks} callbacks - Callbacks to receive various events.
- */
-export class TopicMe extends Topic {
-  onContactUpdate;
-
-  constructor(callbacks) {
-    super(Const.TOPIC_ME, callbacks);
-
-    // me-specific callbacks
-    if (callbacks) {
-      this.onContactUpdate = callbacks.onContactUpdate;
-    }
-  }
-
-  // Override the original Topic._processMetaDesc.
-  _processMetaDesc(desc) {
-    // Check if online contacts need to be turned off because P permission was removed.
-    const turnOff = (desc.acs && !desc.acs.isPresencer()) && (this.acs && this.acs.isPresencer());
-
-    // Copy parameters from desc object to this topic.
-    mergeObj(this, desc);
-    this._tinode._db.updTopic(this);
-    // Update current user's record in the global cache.
-    this._updateCachedUser(this._tinode._myUID, desc);
-
-    // 'P' permission was removed. All topics are offline now.
-    if (turnOff) {
-      this._tinode.mapTopics((cont) => {
-        if (cont.online) {
-          cont.online = false;
-          cont.seen = Object.assign(cont.seen || {}, {
-            when: new Date()
-          });
-          this._refreshContact('off', cont);
-        }
-      });
-    }
-
-    if (this.onMetaDesc) {
-      this.onMetaDesc(this);
-    }
-  }
-
-  // Override the original Topic._processMetaSubs
-  _processMetaSubs(subs) {
-    let updateCount = 0;
-    subs.forEach((sub) => {
-      const topicName = sub.topic;
-      // Don't show 'me' and 'fnd' topics in the list of contacts.
-      if (topicName == Const.TOPIC_FND || topicName == Const.TOPIC_ME) {
-        return;
-      }
-      sub.online = !!sub.online;
-
-      let cont = null;
-      if (sub.deleted) {
-        cont = sub;
-        this._tinode.cacheRemTopic(topicName);
-        this._tinode._db.remTopic(topicName);
-      } else {
-        // Ensure the values are defined and are integers.
-        if (typeof sub.seq != 'undefined') {
-          sub.seq = sub.seq | 0;
-          sub.recv = sub.recv | 0;
-          sub.read = sub.read | 0;
-          sub.unread = sub.seq - sub.read;
-        }
-
-        const topic = this._tinode.getTopic(topicName);
-        if (topic._new) {
-          delete topic._new;
-        }
-
-        cont = mergeObj(topic, sub);
-        this._tinode._db.updTopic(cont);
-
-        if (Topic.isP2PTopicName(topicName)) {
-          this._cachePutUser(topicName, cont);
-          this._tinode._db.updUser(topicName, cont.public);
-        }
-        // Notify topic of the update if it's an external update.
-        if (!sub._noForwarding && topic) {
-          sub._noForwarding = true;
-          topic._processMetaDesc(sub);
-        }
-      }
-
-      updateCount++;
-
-      if (this.onMetaSub) {
-        this.onMetaSub(cont);
-      }
-    });
-
-    if (this.onSubsUpdated && updateCount > 0) {
-      const keys = [];
-      subs.forEach((s) => {
-        keys.push(s.topic);
-      });
-      this.onSubsUpdated(keys, updateCount);
-    }
-  }
-
-  // Called by Tinode when meta.sub is recived.
-  _processMetaCreds(creds, upd) {
-    if (creds.length == 1 && creds[0] == Const.DEL_CHAR) {
-      creds = [];
-    }
-    if (upd) {
-      creds.forEach((cr) => {
-        if (cr.val) {
-          // Adding a credential.
-          let idx = this._credentials.findIndex((el) => {
-            return el.meth == cr.meth && el.val == cr.val;
-          });
-          if (idx < 0) {
-            // Not found.
-            if (!cr.done) {
-              // Unconfirmed credential replaces previous unconfirmed credential of the same method.
-              idx = this._credentials.findIndex((el) => {
-                return el.meth == cr.meth && !el.done;
-              });
-              if (idx >= 0) {
-                // Remove previous unconfirmed credential.
-                this._credentials.splice(idx, 1);
-              }
-            }
-            this._credentials.push(cr);
-          } else {
-            // Found. Maybe change 'done' status.
-            this._credentials[idx].done = cr.done;
-          }
-        } else if (cr.resp) {
-          // Handle credential confirmation.
-          const idx = this._credentials.findIndex((el) => {
-            return el.meth == cr.meth && !el.done;
-          });
-          if (idx >= 0) {
-            this._credentials[idx].done = true;
-          }
-        }
-      });
-    } else {
-      this._credentials = creds;
-    }
-    if (this.onCredsUpdated) {
-      this.onCredsUpdated(this._credentials);
-    }
-  }
-
-  // Process presence change message
-  _routePres(pres) {
-    if (pres.what == 'term') {
-      // The 'me' topic itself is detached. Mark as unsubscribed.
-      this._resetSub();
-      return;
-    }
-
-    if (pres.what == 'upd' && pres.src == Const.TOPIC_ME) {
-      // Update to me's description. Request updated value.
-      this.getMeta(this.startMetaQuery().withDesc().build());
-      return;
-    }
-
-    const cont = this._tinode.cacheGetTopic(pres.src);
-    if (cont) {
-      switch (pres.what) {
-        case 'on': // topic came online
-          cont.online = true;
-          break;
-        case 'off': // topic went offline
-          if (cont.online) {
-            cont.online = false;
-            cont.seen = Object.assign(cont.seen || {}, {
-              when: new Date()
-            });
-          }
-          break;
-        case 'msg': // new message received
-          cont._updateReceived(pres.seq, pres.act);
-          break;
-        case 'upd': // desc updated
-          // Request updated subscription.
-          this.getMeta(this.startMetaQuery().withLaterOneSub(pres.src).build());
-          break;
-        case 'acs': // access mode changed
-          // If 'tgt' is not set then this is an update to the permissions of the current user.
-          // Otherwise it's an update to group topic subscriber permissions while the topic is offline.
-          // Just gnore it then.
-          if (!pres.tgt) {
-            if (cont.acs) {
-              cont.acs.updateAll(pres.dacs);
-            } else {
-              cont.acs = new AccessMode().updateAll(pres.dacs);
-            }
-            cont.touched = new Date();
-          }
-          break;
-        case 'ua':
-          // user agent changed.
-          cont.seen = {
-            when: new Date(),
-            ua: pres.ua
-          };
-          break;
-        case 'recv':
-          // user's other session marked some messges as received.
-          pres.seq = pres.seq | 0;
-          cont.recv = cont.recv ? Math.max(cont.recv, pres.seq) : pres.seq;
-          break;
-        case 'read':
-          // user's other session marked some messages as read.
-          pres.seq = pres.seq | 0;
-          cont.read = cont.read ? Math.max(cont.read, pres.seq) : pres.seq;
-          cont.recv = cont.recv ? Math.max(cont.read, cont.recv) : cont.recv;
-          cont.unread = cont.seq - cont.read;
-          break;
-        case 'gone':
-          // topic deleted or unsubscribed from.
-          this._tinode.cacheRemTopic(pres.src);
-          if (!cont._deleted) {
-            cont._deleted = true;
-            cont._attached = false;
-            this._tinode._db.markTopicAsDeleted(pres.src, true);
-          } else {
-            this._tinode._db.remTopic(pres.src);
-          }
-          break;
-        case 'del':
-          // Update topic.del value.
-          console.log('src del', pres.src);
-          cont._processDelMessages(pres.clear, pres.delseq);
-          break;
-        default:
-          this._tinode.logger("INFO: Unsupported presence update in 'me'", pres.what);
-      }
-
-      this._refreshContact(pres.what, cont);
-    } else {
-      if (pres.what == 'acs') {
-        // New subscriptions and deleted/banned subscriptions have full
-        // access mode (no + or - in the dacs string). Changes to known subscriptions are sent as
-        // deltas, but they should not happen here.
-        const acs = new AccessMode(pres.dacs);
-        if (!acs || acs.mode == AccessMode._INVALID) {
-          this._tinode.logger("ERROR: Invalid access mode update", pres.src, pres.dacs);
-          return;
-        } else if (acs.mode == AccessMode._NONE) {
-          this._tinode.logger("WARNING: Removing non-existent subscription", pres.src, pres.dacs);
-          return;
-        } else {
-          // New subscription. Send request for the full description.
-          // Using .withOneSub (not .withLaterOneSub) to make sure IfModifiedSince is not set.
-          this.getMeta(this.startMetaQuery().withOneSub(undefined, pres.src).build());
-          // Create a dummy entry to catch online status update.
-          const dummy = this._tinode.getTopic(pres.src);
-          dummy.online = false;
-          dummy.acs = acs;
-          this._tinode._db.updTopic(dummy);
-        }
-      } else if (pres.what == 'tags') {
-        this.getMeta(this.startMetaQuery().withTags().build());
-      } else if (pres.what == 'msg') {
-        // Message received for un unknown (previously deleted) topic.
-        this.getMeta(this.startMetaQuery().withOneSub(undefined, pres.src).build());
-        // Create an entry to catch updates and messages.
-        const dummy = this._tinode.getTopic(pres.src);
-        dummy._deleted = false;
-        this._tinode._db.updTopic(dummy);
-      }
-
-      this._refreshContact(pres.what, cont);
-    }
-
-    if (this.onPres) {
-      this.onPres(pres);
-    }
-  }
-
-  // Contact is updated, execute callbacks.
-  _refreshContact(what, cont) {
-    if (this.onContactUpdate) {
-      this.onContactUpdate(what, cont);
-    }
-  }
-
-  /**
-   * Publishing to TopicMe is not supported. {@link Topic#publish} is overriden and thows an {Error} if called.
-   * @memberof Tinode.TopicMe#
-   * @throws {Error} Always throws an error.
-   */
-  publish() {
-    return Promise.reject(new Error("Publishing to 'me' is not supported"));
-  }
-
-  /**
-   * Delete validation credential.
-   * @memberof Tinode.TopicMe#
-   *
-   * @param {string} topic - Name of the topic to delete
-   * @param {string} user - User ID to remove.
-   * @returns {Promise} Promise which will be resolved/rejected on receiving server reply.
-   */
-  delCredential(method, value) {
-    if (!this._attached) {
-      return Promise.reject(new Error("Cannot delete credential in inactive 'me' topic"));
-    }
-    // Send {del} message, return promise
-    return this._tinode.delCredential(method, value).then(ctrl => {
-      // Remove deleted credential from the cache.
-      const index = this._credentials.findIndex((el) => {
-        return el.meth == method && el.val == value;
-      });
-      if (index > -1) {
-        this._credentials.splice(index, 1);
-      }
-      // Notify listeners
-      if (this.onCredsUpdated) {
-        this.onCredsUpdated(this._credentials);
-      }
-      return ctrl;
-    });
-  }
-
-  /**
-   * @callback contactFilter
-   * @param {Object} contact to check for inclusion.
-   * @returns {boolean} <code>true</code> if contact should be processed, <code>false</code> to exclude it.
-   */
-  /**
-   * Iterate over cached contacts.
-   *
-   * @function
-   * @memberof Tinode.TopicMe#
-   * @param {TopicMe.ContactCallback} callback - Callback to call for each contact.
-   * @param {contactFilter=} filter - Optionally filter contacts; include all if filter is false-ish, otherwise
-   *      include those for which filter returns true-ish.
-   * @param {Object=} context - Context to use for calling the `callback`, i.e. the value of `this` inside the callback.
-   */
-  contacts(callback, filter, context) {
-    this._tinode.mapTopics((c, idx) => {
-      if (c.isCommType() && (!filter || filter(c))) {
-        callback.call(context, c, idx);
-      }
-    });
-  }
-
-  /**
-   * Get a contact from cache.
-   * @memberof Tinode.TopicMe#
-   *
-   * @param {string} name - Name of the contact to get, either a UID (for p2p topics) or a topic name.
-   * @returns {Tinode.Contact} - Contact or `undefined`.
-   */
-  getContact(name) {
-    return this._tinode.cacheGetTopic(name);
-  }
-
-  /**
-   * Get access mode of a given contact from cache.
-   * @memberof Tinode.TopicMe#
-   *
-   * @param {string} name - Name of the contact to get access mode for, either a UID (for p2p topics)
-   *        or a topic name; if missing, access mode for the 'me' topic itself.
-   * @returns {string} - access mode, such as `RWP`.
-   */
-  getAccessMode(name) {
-    if (name) {
-      const cont = this._tinode.cacheGetTopic(name);
-      return cont ? cont.acs : null;
-    }
-    return this.acs;
-  }
-
-  /**
-   * Check if contact is archived, i.e. contact.private.arch == true.
-   * @memberof Tinode.TopicMe#
-   *
-   * @param {string} name - Name of the contact to check archived status, either a UID (for p2p topics) or a topic name.
-   * @returns {boolean} - true if contact is archived, false otherwise.
-   */
-  isArchived(name) {
-    const cont = this._tinode.cacheGetTopic(name);
-    return cont && cont.private && !!cont.private.arch;
-  }
-
-  /**
-   * @typedef Tinode.Credential
-   * @memberof Tinode
-   * @type Object
-   * @property {string} meth - validation method such as 'email' or 'tel'.
-   * @property {string} val - credential value, i.e. 'jdoe@example.com' or '+17025551234'
-   * @property {boolean} done - true if credential is validated.
-   */
-  /**
-   * Get the user's credentials: email, phone, etc.
-   * @memberof Tinode.TopicMe#
-   *
-   * @returns {Tinode.Credential[]} - array of credentials.
-   */
-  getCredentials() {
-    return this._credentials;
-  }
-}
-
-/**
- * Special case of {@link Tinode.Topic} for searching for contacts and group topics
- * @extends Tinode.Topic
- *
- */
-export class TopicFnd extends Topic {
-  // List of users and topics uid or topic_name -> Contact object)
-  _contacts = {};
-
-  /**
-   * Create TopicFnd.
-   *
-   * @param {TopicFnd.Callbacks} callbacks - Callbacks to receive various events.
-   */
-  constructor(callbacks) {
-    super(Const.TOPIC_FND, callbacks);
-  }
-
-  // Override the original Topic._processMetaSubs
-  _processMetaSubs(subs) {
-    let updateCount = Object.getOwnPropertyNames(this._contacts).length;
-    // Reset contact list.
-    this._contacts = {};
-    for (let idx in subs) {
-      let sub = subs[idx];
-      const indexBy = sub.topic ? sub.topic : sub.user;
-
-      sub = mergeToCache(this._contacts, indexBy, sub);
-      updateCount++;
-
-      if (this.onMetaSub) {
-        this.onMetaSub(sub);
-      }
-    }
-
-    if (updateCount > 0 && this.onSubsUpdated) {
-      this.onSubsUpdated(Object.keys(this._contacts));
-    }
-  }
-
-  /**
-   * Publishing to TopicFnd is not supported. {@link Topic#publish} is overriden and thows an {Error} if called.
-   * @memberof Tinode.TopicFnd#
-   * @throws {Error} Always throws an error.
-   */
-  publish() {
-    return Promise.reject(new Error("Publishing to 'fnd' is not supported"));
-  }
-
-  /**
-   * setMeta to TopicFnd resets contact list in addition to sending the message.
-   * @memberof Tinode.TopicFnd#
-   * @param {Tinode.SetParams} params parameters to update.
-   * @returns {Promise} Promise to be resolved/rejected when the server responds to request.
-   */
-  setMeta(params) {
-    return Object.getPrototypeOf(TopicFnd.prototype).setMeta.call(this, params).then(_ => {
-      if (Object.keys(this._contacts).length > 0) {
-        this._contacts = {};
-        if (this.onSubsUpdated) {
-          this.onSubsUpdated([]);
-        }
-      }
-    });
-  }
-
-  /**
-   * Iterate over found contacts. If callback is undefined, use {@link this.onMetaSub}.
-   * @function
-   * @memberof Tinode.TopicFnd#
-   * @param {TopicFnd.ContactCallback} callback - Callback to call for each contact.
-   * @param {Object} context - Context to use for calling the `callback`, i.e. the value of `this` inside the callback.
-   */
-  contacts(callback, context) {
-    const cb = (callback || this.onMetaSub);
-    if (cb) {
-      for (let idx in this._contacts) {
-        cb.call(context, this._contacts[idx], idx, this._contacts);
-      }
-    }
   }
 }
