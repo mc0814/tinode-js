@@ -1081,6 +1081,26 @@ class DB {
       };
     });
   }
+  mapMessages(topicName, callback, context) {
+    if (!this.isReady()) {
+      return this.disabled ? Promise.resolve([]) : Promise.reject(new Error("not initialized"));
+    }
+    return new Promise((resolve, reject) => {
+      const trx = this.db.transaction(['message']);
+      trx.onerror = event => {
+        this.#logger('PCache', 'mapMessages', event.target.error);
+        reject(event.target.error);
+      };
+      trx.objectStore('message').getAll(IDBKeyRange.bound([topicName, 0], [topicName, Number.MAX_SAFE_INTEGER])).onsuccess = event => {
+        if (callback) {
+          event.target.result.forEach(message => {
+            callback.call(context, message);
+          });
+        }
+        resolve(event.target.result);
+      };
+    });
+  }
   addMessage(msg) {
     if (!this.isReady()) {
       return this.disabled ? Promise.resolve() : Promise.reject(new Error("not initialized"));
@@ -1122,6 +1142,36 @@ class DB {
           topic: topicName,
           seq: seq,
           _status: status
+        }));
+        trx.commit();
+      };
+    });
+  }
+  updMessageExpired(topicName, seq, expirePeriod, expired) {
+    if (!this.isReady()) {
+      return this.disabled ? Promise.resolve() : Promise.reject(new Error("not initialized"));
+    }
+    return new Promise((resolve, reject) => {
+      const trx = this.db.transaction(['message'], 'readwrite');
+      trx.onsuccess = event => {
+        resolve(event.target.result);
+      };
+      trx.onerror = event => {
+        this.#logger('PCache', 'updMessageExpired', event.target.error);
+        reject(event.target.error);
+      };
+      const req = trx.objectStore('message').get(IDBKeyRange.only([topicName, seq]));
+      req.onsuccess = event => {
+        const src = req.result || event.target.result;
+        if (!src || src.expirePeriod == expirePeriod && src.expired == expired) {
+          trx.commit();
+          return;
+        }
+        trx.objectStore('message').put(DB.#serializeMessage(src, {
+          topic: topicName,
+          seq: seq,
+          expirePeriod: expirePeriod,
+          expired: expired
         }));
         trx.commit();
       };
@@ -1324,7 +1374,7 @@ class DB {
       };
     });
   }
-  static #topic_fields = ['created', 'updated', 'deleted', 'touched', 'read', 'recv', 'seq', 'clear', 'defacs', 'creds', 'public', 'trusted', 'private', '_aux', '_deleted'];
+  static #topic_fields = ['created', 'updated', 'deleted', 'touched', 'read', 'recv', 'seq', 'clear', 'defacs', 'creds', 'public', 'trusted', 'private', '_aux', '_deleted', 'expirePeriod'];
   static #deserializeTopic(topic, src) {
     DB.#topic_fields.forEach(f => {
       if (src.hasOwnProperty(f)) {
@@ -1372,7 +1422,7 @@ class DB {
     return res;
   }
   static #serializeMessage(dst, msg) {
-    const fields = ['topic', 'seq', 'ts', '_status', 'from', 'head', 'content'];
+    const fields = ['topic', 'seq', 'ts', '_status', 'from', 'head', 'content', 'expirePeriod', 'expired'];
     const res = dst || {};
     fields.forEach(f => {
       if (msg.hasOwnProperty(f)) {
@@ -3931,6 +3981,7 @@ class Topic {
     this.private = null;
     this.public = null;
     this.trusted = null;
+    this.expirePeriod = 86400;
     this._users = {};
     this._queuedSeqId = _config_js__WEBPACK_IMPORTED_MODULE_3__.LOCAL_SEQID;
     this._maxSeq = 0;
@@ -4046,7 +4097,9 @@ class Topic {
     });
   }
   createMessage(data, noEcho) {
-    return this._tinode.createMessage(this.name, data, noEcho);
+    let pub = this._tinode.createMessage(this.name, data, noEcho);
+    pub.expirePeriod = this.expirePeriod;
+    return pub;
   }
   publish(data, noEcho) {
     return this.publishMessage(this.createMessage(data, noEcho));
@@ -4365,6 +4418,23 @@ class Topic {
       _all: true
     }], hardDel);
   }
+  softDelAllMessages() {
+    return this._tinode.delAllMessages();
+  }
+  changeExpirePeriod(expirePeriod) {
+    return this._tinode.setMeta(this.name, {
+      sub: {
+        expirePeriod: expirePeriod
+      }
+    }).then(_ => {
+      this.setExpirePeriod(expirePeriod);
+    });
+  }
+  setExpirePeriod(expirePeriod) {
+    if (this.expirePeriod !== expirePeriod) {
+      this.expirePeriod = expirePeriod;
+    }
+  }
   delMessagesList(list, hardDel) {
     return this.delMessages((0,_utils_js__WEBPACK_IMPORTED_MODULE_6__.listToRanges)(list), hardDel);
   }
@@ -4668,8 +4738,10 @@ class Topic {
     const idx = this._messages.find({
       seq: seqId
     });
+    console.log('flushMessage1', this.name, idx, seqId);
     delete this._messageVersions[seqId];
     if (idx >= 0) {
+      console.log('flushMessage2', this.name, idx, seqId);
       this._tinode._db.remMessages(this.name, seqId);
       return this._messages.delAt(idx);
     }
@@ -4881,6 +4953,12 @@ class Topic {
   _routePres(pres) {
     let user, uid;
     switch (pres.what) {
+      case 'updateMsg':
+        console.log('updateMsg', pres);
+        console.log('updateMsg1', this._messages);
+        this._tinode._db.updMessageExpired(this.name, pres.seq, pres.expirePeriod, pres.expired);
+        const topic = this;
+        break;
       case 'del':
         this._processDelMessages(pres.clear, pres.delseq);
         break;
@@ -4977,6 +5055,9 @@ class Topic {
       delete desc.defacs;
       this._tinode._db.updUser(this.name, desc.public);
     }
+    if (desc.hasOwnProperty('expirePeriod')) {
+      this.expirePeriod = desc.expirePeriod;
+    }
     (0,_utils_js__WEBPACK_IMPORTED_MODULE_6__.mergeObj)(this, desc);
     this._tinode._db.updTopic(this);
     if (this.name !== _config_js__WEBPACK_IMPORTED_MODULE_3__.TOPIC_ME && !desc._noForwarding) {
@@ -5042,6 +5123,7 @@ class Topic {
     this._maxDel = Math.max(clear, this._maxDel);
     this.clear = Math.max(clear, this.clear);
     let count = 0;
+    console.log('_processDelMessages1', clear, delseq);
     if (Array.isArray(delseq)) {
       delseq.forEach(rec => {
         if (!rec.hi) {
@@ -5177,7 +5259,7 @@ __webpack_require__.r(__webpack_exports__);
 
 
 function jsonParseHelper(key, val) {
-  if (typeof val == 'string' && val.length >= 20 && val.length <= 24 && ['ts', 'touched', 'updated', 'created', 'when', 'deleted', 'expires'].includes(key)) {
+  if (typeof val == 'string' && val.length >= 20 && val.length <= 24 && ['ts', 'touched', 'updated', 'created', 'when', 'deleted', 'expires', 'expired'].includes(key)) {
     const date = new Date(val);
     if (!isNaN(date)) {
       return date;
@@ -5384,8 +5466,7 @@ function clipInRange(src, clip) {
     low: Math.max(src.low, clip.low),
     hi: Math.min(src.hi, clip.hi)
   };
-  // removed by dead control flow
-{}
+  return result;
 }
 
 /***/ }),
@@ -5485,7 +5566,7 @@ const PACKAGE_VERSION = "0.24.4";
 /******/ 	
 /************************************************************************/
 var __webpack_exports__ = {};
-// This entry needs to be wrapped in an IIFE because it needs to be isolated against other modules in the chunk.
+// This entry need to be wrapped in an IIFE because it need to be isolated against other modules in the chunk.
 (() => {
 /*!***********************!*\
   !*** ./src/tinode.js ***!
@@ -5584,7 +5665,8 @@ initForNonBrowserApp();
 function initForNonBrowserApp() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
   if (typeof btoa == 'undefined') {
-    __webpack_require__.g.btoa = function (input = '') {
+    __webpack_require__.g.btoa = function () {
+      let input = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : '';
       let str = input;
       let output = '';
       for (let block = 0, charCode, i = 0, map = chars; str.charAt(i | 0) || (map = '=', i % 1); output += map.charAt(63 & block >> 8 - i % 1 * 8)) {
@@ -5598,7 +5680,8 @@ function initForNonBrowserApp() {
     };
   }
   if (typeof atob == 'undefined') {
-    __webpack_require__.g.atob = function (input = '') {
+    __webpack_require__.g.atob = function () {
+      let input = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : '';
       let str = input.replace(/=+$/, '');
       let output = '';
       if (str.length % 4 == 1) {
@@ -5826,10 +5909,13 @@ class Tinode {
       });
     }
   }
-  logger(str, ...args) {
+  logger(str) {
     if (this._loggingEnabled) {
       const d = new Date();
       const dateString = ('0' + d.getUTCHours()).slice(-2) + ':' + ('0' + d.getUTCMinutes()).slice(-2) + ':' + ('0' + d.getUTCSeconds()).slice(-2) + '.' + ('00' + d.getUTCMilliseconds()).slice(-3);
+      for (var _len = arguments.length, args = new Array(_len > 1 ? _len - 1 : 0), _key = 1; _key < _len; _key++) {
+        args[_key - 1] = arguments[_key];
+      }
       console.log('[' + dateString + ']', str, args.join(' '));
     }
   }
@@ -6623,6 +6709,12 @@ class Tinode {
     pkt.del.hard = hard;
     return this.#send(pkt, pkt.del.id);
   }
+  softDelAllMessages() {
+    const pkt = this.#initPacket('del', 'me');
+    pkt.del.what = 'softDelAllMsg';
+    pkt.del.hard = false;
+    return this.#send(pkt, pkt.del.id);
+  }
   delTopic(topicName, hard) {
     const pkt = this.#initPacket('del', topicName);
     pkt.del.what = 'topic';
@@ -6757,6 +6849,31 @@ class Tinode {
     } else {
       this._messageId = 0;
     }
+  }
+  deleteExpiredMessages() {
+    const now = new Date();
+    this._db.mapTopics(data => {
+      let topic = this.#cacheGet('topic', data.name);
+      if (!topic) {
+        if (data.name == _config_js__WEBPACK_IMPORTED_MODULE_1__.TOPIC_ME) {
+          topic = new _me_topic_js__WEBPACK_IMPORTED_MODULE_10__["default"]();
+        } else if (data.name == _config_js__WEBPACK_IMPORTED_MODULE_1__.TOPIC_FND) {
+          topic = new _fnd_topic_js__WEBPACK_IMPORTED_MODULE_9__["default"]();
+        } else {
+          topic = new _topic_js__WEBPACK_IMPORTED_MODULE_8__["default"](data.name);
+        }
+      }
+      this._db.mapMessages(data.name, message => {
+        if (message.expired && message.expired <= now) {
+          console.log('比较', message.expired, now);
+          topic.flushMessage(message.seq);
+          if (topic.onData) {
+            topic.onData();
+          }
+          console.log(data.name, 'expire', message);
+        }
+      });
+    });
   }
   onWebsocketOpen = undefined;
   onConnect = undefined;
